@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+httpx>=0.27
+asyncpg>=0.29
+# anthropic>=0.40   # нужен, только если вернёшься на Claude (LLM_PROVIDER=anthropic)

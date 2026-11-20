@@ -1,0 +1,15 @@
+# Для Linux-сервера (Oracle Free, любой VPS). Положи в /etc/systemd/system/replybot.service
+[Unit]
+Description=Telegram reply bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/tg-reply-bot
+ExecStart=/opt/tg-reply-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+User=replybot
+
+[Install]
+WantedBy=multi-user.target
