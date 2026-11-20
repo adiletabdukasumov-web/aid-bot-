@@ -295,9 +295,15 @@ def context_note(rows) -> str:
     )
 
 
-def build_system(rows, extra: str = "") -> str:
+# Неизменная часть инструкций (стиль + правила) идёт первой и всегда одинаковая:
+# OpenAI кэширует такой одинаковый «префикс», и повторно он стоит в ~20 раз дешевле.
+STABLE_SYSTEM = STYLE + "\n\n" + RULES
+
+
+def build_dynamic(rows, extra: str = "") -> str:
+    """Меняющаяся часть: подходящие примеры, время/пауза, подсказка. Идёт в конце, чтобы не ломать кэш."""
     last_q = trailing_client_text(rows)
-    parts = [STYLE]
+    parts = []
     ex = pick_examples(last_q)
     if ex:
         parts.append(
@@ -305,10 +311,14 @@ def build_system(rows, extra: str = "") -> str:
             + "\n\n".join(f"Клиент: {e['q']}\nЯ: {e['a']}" for e in ex)
         )
     parts.append(context_note(rows))
-    parts.append(RULES)
+    parts.append("Ответь на последние сообщения клиента по правилам выше.")
     if extra:
         parts.append(extra)
     return "\n\n".join(parts)
+
+
+def build_system(rows, extra: str = "") -> str:
+    return STABLE_SYSTEM + "\n\n" + build_dynamic(rows, extra)
 
 
 def to_messages(rows) -> list[dict]:
@@ -351,8 +361,9 @@ async def _openai_call(c: httpx.AsyncClient, model: str, system: str, msgs: list
 async def _openai_call_once(c: httpx.AsyncClient, model: str, system: str, msgs: list[dict], reasoning: str, tier: str):
     body = {
         "model": model,
-        "messages": [{"role": "system", "content": system}] + msgs,
+        "messages": [{"role": "system", "content": STABLE_SYSTEM}] + msgs + [{"role": "system", "content": system}],
         "max_completion_tokens": 1500,
+        "prompt_cache_key": "replybot-style-v1",
     }
     if reasoning:
         body["reasoning_effort"] = reasoning
@@ -394,15 +405,32 @@ async def llm_openai(system: str, msgs: list[dict]) -> str:
             if model != active_openai_model:
                 log.warning("переключился на модель %s", model)
                 active_openai_model = model
-            return (r.json()["choices"][0]["message"].get("content") or "").strip()
+            data = r.json()
+            track_usage(data.get("usage") or {})
+            return (data["choices"][0]["message"].get("content") or "").strip()
     raise RuntimeError(f"Ни одна модель OpenAI не доступна этому ключу (пробовал: {', '.join(tried)}). Посмотри /models")
 
 
+usage_stats = {"calls": 0, "input": 0, "cached": 0, "output": 0, "since": time.time()}
+
+
+def track_usage(u: dict):
+    inp = int(u.get("prompt_tokens") or u.get("input_tokens") or 0)
+    det = u.get("prompt_tokens_details") or u.get("input_tokens_details") or {}
+    cached = int(det.get("cached_tokens") or 0)
+    out = int(u.get("completion_tokens") or u.get("output_tokens") or 0)
+    usage_stats["calls"] += 1
+    usage_stats["input"] += inp
+    usage_stats["cached"] += cached
+    usage_stats["output"] += out
+    log.info("tokens: input=%d (из кэша %d) output=%d", inp, cached, out)
+
+
 async def llm(rows, extra: str = "") -> str:
-    system = build_system(rows, extra)
     msgs = to_messages(rows)
     if LLM_PROVIDER == "openai":
-        return await llm_openai(system, msgs)
+        return await llm_openai(build_dynamic(rows, extra), msgs)
+    system = build_system(rows, extra)
     resp = await ai.messages.create(model=MODEL, max_tokens=500, system=system, messages=msgs)
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
@@ -750,6 +778,17 @@ def ai_label() -> str:
     return f"Claude, {MODEL}"
 
 
+def usage_line() -> str:
+    u = usage_stats
+    if not u["calls"]:
+        return "Токены с запуска: пока ни одного запроса к ИИ"
+    pct = int(100 * u["cached"] / u["input"]) if u["input"] else 0
+    return (
+        f"Токены с запуска: {u['calls']} запросов, вход {u['input']} (из кэша {pct}%), выход {u['output']}, "
+        f"в среднем {(u['input'] + u['output']) // u['calls']} на запрос"
+    )
+
+
 @router.message(Command("status"), owner)
 async def cmd_status(m: Message):
     mode = await get_setting("mode", "draft")
@@ -769,6 +808,7 @@ async def cmd_status(m: Message):
         ),
         f"Голосовые: {'расшифровываю (' + active_stt_model + ')' if STT_API_KEY else 'НЕ настроены (нет STT_API_KEY)'}",
         f"ИИ: {ai_label()}; примеров стиля: {len(EXAMPLES)}",
+        usage_line(),
         f"База: {'PostgreSQL' if db.kind == 'postgres' else 'файл ' + SQLITE_PATH}",
     ]
     if last_business_msg["ts"]:
